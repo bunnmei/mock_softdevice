@@ -10,10 +10,12 @@ use embassy_nrf::{gpio::{Level, Output, OutputDrive}};
 use embassy_nrf::config::{HfclkSource, LfclkSource};
 use static_cell::StaticCell;
 
+use crate::temp::temp_set_task;
+
 use {defmt_rtt as _, panic_probe as _};
 use defmt::*;
 
-use nrf_softdevice::{Softdevice, ble::gatt_server::characteristic, raw};
+use nrf_softdevice::{Softdevice, ble::{DeferredReadReply, gatt_server::characteristic}, raw};
 use nrf_softdevice::ble::advertisement_builder::{
     Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
     AdvertisementDataType
@@ -24,7 +26,15 @@ use nrf_softdevice::ble::gatt_server::{CharacteristicHandles, RegisterError, Wri
 use nrf_softdevice::ble::{gatt_server, peripheral, Connection, Uuid, SecurityMode, EncryptionInfo, IdentityKey, MasterId,};
 use nrf_softdevice::ble::security::{SecurityHandler, IoCapabilities,};
 
+
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+
 const PERIPHERAL_REQUESTS_SECURITY: bool = false;
+
+pub static SHARED_NOTIF: Mutex<ThreadModeRawMutex, bool> = Mutex::new(false);
+static SERVER: StaticCell<Server> = StaticCell::new();
+mod temp;
 
 #[embassy_executor::task]
 async fn softdevice_task(sd: &'static Softdevice) -> ! {
@@ -77,8 +87,10 @@ async fn main(spawner: Spawner) {
 
     let sd= Softdevice::enable(&config);
     
-    let server = Server::new(sd).unwrap();
+    let server = SERVER.init( Server::new(sd).unwrap());
     unwrap!(spawner.spawn(softdevice_task(sd)));
+    // let r: embassy_nrf::Peri<'_, embassy_nrf::peripherals::RNG> = p.RNG;
+    spawner.spawn(temp_set_task(sd)).unwrap();
 
     let mut led = Output::new(p.P0_15, Level::Low, OutputDrive::Standard);
 
@@ -95,6 +107,7 @@ async fn main(spawner: Spawner) {
     let bonder = BONDER.init(Bounder::default());
 
     loop {
+        Timer::after(Duration::from_secs(1)).await;
         let config = peripheral::Config::default();
         let adv= peripheral::ConnectableAdvertisement::ScannableUndirected {
             adv_data: &ADV_DATA,
@@ -113,8 +126,45 @@ async fn main(spawner: Spawner) {
             }
         }
 
-        let e = gatt_server::run(&conn, &server, |_| {}).await;
+        unsafe {
+            temp::BLE_STATE.lock_mut(|b| {
+                *b = temp::BLEConnect::Connected;
+                info!("set ble connect");
+            })
+        }
+     
+     
+        spawner.spawn(temp::temp_notify_task(conn.clone(), server)).unwrap();
 
+        let e = gatt_server::run(&conn, server, |e| {
+            match  e {
+                ServerEvent::Temp(e) => {
+                    match e {
+                        TempServiceEvent::TempCccdWrite {notification} => {}
+                        TempServiceEvent::TempRead { offset, reply} => {
+                            temp::SHARED_TEMP.lock(|cdata| {
+                                let dammy_rand = *cdata;
+                                let val_option = Some(dammy_rand.as_slice());
+                                reply.reply(Ok(val_option));
+                            })
+                            // temp::SHARED_COUNT.lock(|d| {
+                            //     let dummy_bytes: [u8; 2] = [0x00, *d];
+                            //     let value_option: Option<&[u8]> = Some(dummy_bytes.as_slice());
+                            //     reply.reply(Ok(value_option));
+                            // });
+                        }
+                    }
+                    info!("called read");
+                }
+            }
+        }).await;
+
+        unsafe {
+            temp::BLE_STATE.lock_mut(|b| {
+                *b = temp::BLEConnect::Disconnected;
+                info!("set ble disconnected");
+            })
+        }
     }
 }
 
@@ -149,7 +199,6 @@ impl SecurityHandler for Bounder {
     }
 
     fn on_bonded(&self, _conn: &Connection, master_id: MasterId, key: EncryptionInfo, peer_id: IdentityKey) {
-        
         self.sys_attrs.borrow_mut().clear();
         self.peer.set(Some(Peer {
             master_id,
@@ -196,6 +245,14 @@ impl SecurityHandler for Bounder {
     }
 }
 
+
+
+#[allow(unused)]
+pub enum TempServiceEvent {
+    TempCccdWrite {notification: bool},
+    TempRead { offset: usize, reply: DeferredReadReply}
+}
+
 pub struct TempService{
     value_handle: u16,
     cccd_handle: u16,
@@ -203,19 +260,17 @@ pub struct TempService{
 
 impl TempService {
     pub fn new(sd: &mut Softdevice) -> Result<Self, RegisterError> {
-        let uuid: [u8; 16]= [0x81, 0x1b, 0x86, 0x4d, 0x71, 0x8c, 0xb0, 0x35,
-            0x80, 0x4d, 0x92, 0xc4, 0x76, 0x12, 0x43, 0xc0];
+        let uuid: [u8; 16]= [0xc0, 0x43, 0x12, 0x76, 0xc4, 0x92, 0x4d, 0x80, 0x35, 0xb0, 0x8c, 0x71, 0x4d, 0x86, 0x1b, 0x81];
         let mut service_builder = ServiceBuilder::new(sd, Uuid::new_128(&uuid))?;
 
-        let attr = Attribute::new(&[0u8; 2])
+        let attr = Attribute::new(&[0u8; 4])
                 .security(SecurityMode::Open)
                 .deferred_read()
                 .read_security(SecurityMode::Open); // セキュリティモードを設定?
         let metadata = Metadata::new(Properties::new().read().notify()); // 読み取りと通知を許可
         let characteristic_builder = service_builder.add_characteristic(
             Uuid::new_128(&[
-                0x06, 0x01, 0xa0, 0x01, 0x0e, 0xca, 0xb5, 0xab,
-                0xed, 0xc2, 0x88, 0x7f, 0xd5, 0xf3, 0x2b, 0x84,
+                0x84, 0x2b, 0xf3, 0xd5, 0x7f, 0x88, 0xc2, 0xed, 0xab, 0xb5, 0xca, 0x0e, 0x01, 0xa0, 0x01, 0x06
             ]),
             attr,
             metadata,
@@ -239,18 +294,30 @@ impl TempService {
         gatt_server::set_value(sd, self.value_handle, &[data])
     }
 
-    pub fn temp_notify(&self, conn: &Connection, data: u8) -> Result<(), gatt_server::NotifyValueError> {
-        gatt_server::notify_value(conn, self.value_handle, &[data])
+    pub fn temp_notify(&self, conn: &Connection, data: &[u8; 4]) -> Result<(), gatt_server::NotifyValueError> {
+        gatt_server::notify_value(conn, self.value_handle, data)
     }
 
     pub fn on_write(&self, handle: u16, data: &[u8]) {
         if handle == self.cccd_handle && !data.is_empty() {
             // 書き込み処理
             info!("Temperature characteristic written: {:?}", data);
+            unsafe {
+                SHARED_NOTIF.lock_mut(|dbool|{
+                    *dbool = data[0] != 0;
+                });
+            }
         }
     }
+    pub fn on_deferred_read(&self, handle: u16, offset: usize, reply: DeferredReadReply) -> Option<TempServiceEvent> {
+        if handle == self.value_handle {
+            return Some(TempServiceEvent::TempRead { offset, reply });
+        }
+
+        None
+    }
 }
-struct Server {
+pub struct Server {
     temp: TempService
 }
 
@@ -262,8 +329,12 @@ impl Server {
     }
 }
 
+pub enum ServerEvent {
+    Temp(TempServiceEvent)
+}
+
 impl gatt_server::Server for Server {
-    type Event = ();
+    type Event = ServerEvent;
 
     fn on_write(
         &self,
@@ -279,15 +350,11 @@ impl gatt_server::Server for Server {
     }
 
     fn on_deferred_read(&self, handle: u16, offset: usize, reply: nrf_softdevice::ble::DeferredReadReply) -> Option<Self::Event> {
-        // 1. 送信したいデータ (2バイト) を定義
-        const DUMMY_VALUE: u16 = 0x1234;
-        let dummy_bytes: [u8; 2] = DUMMY_VALUE.to_le_bytes();
-        let value_option: Option<&[u8]> = Some(dummy_bytes.as_slice());
-        
-        reply.reply(Ok(value_option));
-            
-        
+        if let Some(e) = self.temp.on_deferred_read(handle, offset, reply) {
+            return Some(ServerEvent::Temp(e));
+        }
         None
     }
 
 }
+
